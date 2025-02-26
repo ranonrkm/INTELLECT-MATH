@@ -758,29 +758,57 @@ def main(args: FlatArguments):
     )
 
     # Optimizer
+    # identify centroid parameters that are frozen when model is trained, and trained when model is frozen - alternating optimization
+    centroid_params = [p for n, p in model.named_parameters() if "centroid" in n]
+    model_params = [(n, p) for n, p in model.named_parameters() if "centroid" not in n]
+
     # Split weights in two groups, one with weight decay and the other not.
     no_decay = ["bias", "layer_norm.weight"]
-    optimizer_grouped_parameters = [
+    optimizer_grouped_parameters_model = [
         {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "params": [p for n, p in model_params if not any(nd in n for nd in no_decay)],
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [p for n, p in model_params if any(nd in n for nd in no_decay)],
             "weight_decay": 0.0,
         },
+    ]
+    optimizer_grouped_parameters_centroid = [
+        {"params": centroid_params, "weight_decay": 0.0}  # Assuming no weight decay for centroids
     ]
     if args.use_qlora:
         from bitsandbytes.optim import AdamW
 
         optimizer = AdamW(
-            optimizer_grouped_parameters,
+            optimizer_grouped_parameters_model,
             lr=args.learning_rate,
             optim_bits=8 if args.use_8bit_optimizer else 32,
             is_paged=True,
         )
     else:
-        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate, fused=args.fused_optimizer)
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters_model, lr=args.learning_rate, fused=args.fused_optimizer)
+    optimizer_centroid = torch.optim.AdamW(optimizer_grouped_parameters_centroid, lr=args.learning_rate_centroid)   # TODO: add to args
+
+    def enable_model_training(model):
+        for n, p in model.named_parameters():
+            if "centroid" in n:
+                p.requires_grad = False
+            else:
+                p.requires_grad = True
+        # TODO: for debugging
+        # for n, p in model.named_parameters():
+        #     print(n, p.requires_grad)
+
+    def enable_centroid_training(model):
+        for n, p in model.named_parameters():
+            if "centroid" in n:
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+        # TODO: for debugging
+        # for n, p in model.named_parameters():
+        #     print(n, p.requires_grad)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -811,8 +839,8 @@ def main(args: FlatArguments):
         num_warmup_steps=int(num_training_steps_for_scheduler * args.warmup_ratio),
     )
     # Prepare everything with `accelerator`.
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
+    model, optimizer_model, optimizer_centroid, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer_model, optimizer_centroid, train_dataloader, lr_scheduler
     )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
@@ -899,20 +927,47 @@ def main(args: FlatArguments):
         train_dataloader.set_epoch(epoch)
         total_loss = 0
         total_aux_loss = 0
+        total_centroid_loss = 0
         if last_checkpoint_path and resume_step is not None:
             # We skip the first `n` batches in the dataloader when resuming from a checkpoint
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
         else:
             active_dataloader = train_dataloader
+
+        train_model_iters = 90
+        train_centroid_iters = 10
+        train_iter_cycle = train_model_iters + train_centroid_iters
+        # every 100 steps, train the model for 90 steps (keeping the centroids frozen), and then train the centroids for 10 steps (keeping the model frozen)
+        is_training_model = True
+        is_training_centroids = False
+
         for step, batch in enumerate(active_dataloader):
             local_total_tokens += batch["attention_mask"].sum()
             total_token_including_padding += batch["attention_mask"].numel()
+
+            if step % train_iter_cycle == 0:
+                optimizer = optimizer_model
+                enable_model_training(model)    # TODO: implement
+                is_training_model = True
+                is_training_centroids = False
+            elif step % train_iter_cycle == train_model_iters:
+                optimizer = optimizer_centroid
+                enable_centroid_training(model) # TODO: implement
+                is_training_model = False
+                is_training_centroids = True
+
             with accelerator.accumulate(model):
-                if args.load_balancing_loss:
-                    outputs = model(**batch, use_cache=False, output_router_logits=True)
+                if is_training_model:
+                    # phase 1: train the model
+                    if args.load_balancing_loss:
+                        outputs = model(**batch, use_cache=False, output_router_logits=True)
+                    else:
+                        outputs = model(**batch, use_cache=False)
                 else:
-                    outputs = model(**batch, use_cache=False)
-                if args.reduce_loss == "mean":
+                    # phase 2: train the centroids
+                    outputs = model(**batch, use_cache=False, train_centroids=True)
+
+                if args.reduce_loss == "mean" or is_training_centroids:
                     loss = outputs.loss
                 else:
                     # reduce loss is sum
@@ -938,27 +993,56 @@ def main(args: FlatArguments):
                         aux_loss = args.load_balancing_weight * outputs.aux_loss
                         loss += aux_loss
                 # We keep track of the loss at each logged step
-                total_loss += loss.detach().float()
+                if is_training_model:
+                    total_loss += loss.detach().float()
+                    if args.load_balancing_loss:
+                        total_aux_loss += aux_loss.detach().float()
+                else:
+                    total_centroid_loss += loss.detach().float()
                 accelerator.backward(loss)
-                if args.load_balancing_loss:
-                    total_aux_loss += aux_loss.detach().float()
-                # clip gradient norm. don't do this with deepspeed
-                if accelerator.sync_gradients and args.clip_grad_norm > 0:
+                
+                # clip gradient norm. don't do this with deepspeed; NOTE: currently only using for model training
+                if is_training_model and accelerator.sync_gradients and args.clip_grad_norm > 0:
                     accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad()
                 lr_scheduler.step()
-
+            
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 completed_steps += 1
                 if args.logging_steps and completed_steps % args.logging_steps == 0:
-                    avg_loss = (
-                        accelerator.gather(total_loss).mean().item()
-                        / args.gradient_accumulation_steps
-                        / args.logging_steps
-                    )
+                    if is_training_model:
+                        avg_loss = (
+                            accelerator.gather(total_loss).mean().item()
+                            / args.gradient_accumulation_steps
+                            / args.logging_steps
+                        )
+                        if args.load_balancing_loss:
+                            avg_aux_loss = (
+                                accelerator.gather(total_aux_loss).mean().item()
+                                / args.gradient_accumulation_steps
+                                / args.logging_steps
+                            )
+                            logger.info(
+                                f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}, Aux Loss: {avg_aux_loss}, TPS: {total_tokens / (time.time() - start_time)}"
+                            )
+                            metrics_to_log["aux_loss"] = avg_aux_loss
+                        else:
+                            logger.info(
+                                f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}, TPS: {total_tokens / (time.time() - start_time)}"
+                            )
+                    else:
+                        avg_loss = (
+                            accelerator.gather(total_centroid_loss).mean().item()
+                            / args.gradient_accumulation_steps
+                            / args.logging_steps
+                        )
+                        logger.info(
+                            f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Centroid Loss: {avg_loss}, TPS: {total_tokens / (time.time() - start_time)}"
+                        )
+
                     total_tokens = accelerator.gather(local_total_tokens).sum().item()
                     total_tokens_including_padding = accelerator.gather(total_token_including_padding).sum().item()
                     metrics_to_log = {
@@ -971,20 +1055,7 @@ def main(args: FlatArguments):
                         / accelerator.num_processes
                         / (time.time() - start_time),
                     }
-                    if args.load_balancing_loss:
-                        avg_aux_loss = (
-                            accelerator.gather(total_aux_loss).mean().item()
-                            / args.gradient_accumulation_steps
-                            / args.logging_steps
-                        )
-                        logger.info(
-                            f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}, Aux Loss: {avg_aux_loss}, TPS: {total_tokens / (time.time() - start_time)}"
-                        )
-                        metrics_to_log["aux_loss"] = avg_aux_loss
-                    else:
-                        logger.info(
-                            f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}, TPS: {total_tokens / (time.time() - start_time)}"
-                        )
+                    
                     if args.with_tracking:
                         accelerator.log(
                             metrics_to_log,
