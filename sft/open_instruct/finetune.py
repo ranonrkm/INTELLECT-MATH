@@ -725,6 +725,18 @@ def main(args: FlatArguments):
         model.gradient_checkpointing_enable()
 
     train_dataset = raw_datasets["train"]
+
+    def format(example):
+        example["messages"] = [
+                {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. Solve the following math problem. Present the final answer in the format: Final Answer: \\boxed{{your_answer}}."},
+                {"role": "user", "content": f"\nProblem: {example['problem']}"},
+                {"role": "assistant", "content": example["solution"]}
+        ]
+        return example
+
+    if "messages" not in train_dataset.column_names:
+        train_dataset = train_dataset.map(format, num_proc=8, remove_columns=train_dataset.column_names, desc="Formatting data")
+
     # debugging tool for fewer samples
     if args.max_train_samples is not None:
         max_train_samples = min(len(train_dataset), args.max_train_samples)
@@ -997,8 +1009,8 @@ def main(args: FlatArguments):
                     if completed_steps % checkpointing_steps == 0:
                         output_dir = f"step_{completed_steps}"
                         if args.output_dir is not None:
-                            output_dir = os.path.join(args.output_dir, output_dir)
-                        accelerator.save_state(output_dir)
+                            state_output_dir = os.path.join(args.output_dir, output_dir)
+                        accelerator.save_state(state_output_dir)
                         # use this to mark the checkpoint as completely saved, to avoid restoring from garbled checkpoints
                         with open(
                             os.path.join(get_last_checkpoint_path(args, incomplete=True), "COMPLETED"), "w"
@@ -1015,6 +1027,14 @@ def main(args: FlatArguments):
                                 os.path.join(args.output_dir, output_dir+"_hf_checkpoint"),
                                 args.use_lora,
                             )
+                            # run eval job;
+                            # if accelerator.is_main_process:
+                            #     model_path = os.path.join(args.output_dir, output_dir)
+                            #     eval_cmd = f"""
+                            #         sbatch intellect-math-scripts/eval.sh {model_path}
+                            #     """
+                            #     subprocess.run(eval_cmd, shell=True, check=True)
+
                             accelerator.wait_for_everyone()
 
                 if completed_steps >= args.max_train_steps:
